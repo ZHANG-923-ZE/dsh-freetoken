@@ -94,6 +94,37 @@ try {
     }
   }
 
+  // C2. 有凭证时预热会加载重模块，但它**不得发生在 apply() 的同步段**
+  //     （否则 enabled-idle 的"零重模块"性质在真实环境会被破坏）。
+  {
+    const { mkdirSync, writeFileSync } = await import('node:fs')
+    mkdirSync(path.join(tempHome, 'freetoken'), { recursive: true })
+    writeFileSync(
+      path.join(tempHome, 'freetoken', 'auth.json'),
+      JSON.stringify({
+        version: 1,
+        account: { id: 'default' },
+        auth: { token: 'a'.repeat(64) },
+        savedAt: Date.now(),
+      }),
+      'utf8',
+    )
+    const ctx = fakeCtx()
+    apply(ctx, { enabled: true })
+    // 同步段：仍未加载任何重模块
+    assert.deepEqual(
+      loadedKeysSnapshot(),
+      [],
+      'warm-up must not load heavy modules synchronously inside apply()',
+    )
+    for (const disposer of ctx.calls.disposers) {
+      if (typeof disposer === 'function') disposer()
+    }
+    // 让出微任务/定时器后再看：此时预热可能已经开始（加载重模块是允许的）。
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    rmSync(path.join(tempHome, 'freetoken'), { recursive: true, force: true })
+  }
+
   // D. 关闭态产物静态检查：入口不应出现重模块/fetch/浏览器字样
   {
     const index = readFileSync(path.join(packageRoot, 'lib', 'index.js'), 'utf8')

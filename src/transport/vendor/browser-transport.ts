@@ -310,9 +310,50 @@ async function prepareTransportProfile(
   profileDir: string,
   waitForReclaim: () => Promise<void>,
 ): Promise<void> {
+  /**
+   * S2.1（2026-10-20 会话所有权）：**默认复用**已有 profile，不再每次启动重建。
+   *
+   * 旧行为（改名→删→新建）的代价是：站点写给这个浏览器的**一切活状态**
+   * （httpOnly cookie、WAF cookie、localStorage 登录态）都不跨启动保留，
+   * 于是每次重启都得靠 `auth.json` 那份快照重新"冒充"登录 —— 而快照有 TTL，
+   * 到点就 401。用户诉求是"就用我登录过的那个会话"，所以这里改为保留。
+   *
+   * 只有 profile 明显损坏（缺 `Local State` / 目录不可写）才重建；
+   * Windows 上"改名删不掉"的 EBUSY 问题也因此绕开（我们不再删它）。
+   */
+  if (existsSync(profileDir) && profileLooksUsable(profileDir)) {
+    /**
+     * 🔴 复用 profile 时**必须先确认旧浏览器真的退出了**（P1-3）。
+     *
+     * 旧的重建路径靠 `waitForReclaim()` 躲开 Windows 上的文件占用；复用路径同样需要它 ——
+     * 否则跨进程残留的旧浏览器还活着时，删句柄会让新 Chromium 误判"无实例"⇒ 同 profile
+     * 双开（profile 数据损坏），删不掉又会"交接给已有实例后自己退出"⇒ 端口超时。
+     * `waitForReclaim` 有 3s 上限且**不抛错**，失败时继续（最坏是多等一下）。
+     */
+    await waitForReclaim()
+    /**
+     * 🔴 复用 profile 时**必须清掉上次残留的"会话句柄"文件**：
+     *
+     * - `DevToolsActivePort`：上一次浏览器写的端口/ws 路径。复用 profile 后这个文件
+     *   还在，`waitForTransportDebugPort` 会**先读到旧端口**并尝试连它 —— 而那个浏览器
+     *   早就退出了，于是启动被判成「调试端口未就绪」或连到死端口（看起来像超时）。
+     * - `SingletonLock` / `SingletonCookie` / `SingletonSocket`（Linux/macOS）与
+     *   `lockfile`：Chromium 的单实例句柄。残留时新进程会误以为"已有实例在跑"，
+     *   把启动**交接给不存在的实例后自己退出**（Windows 上表现为 spawn 立刻 exit）。
+     *
+     * 这些文件只是运行时句柄，不含登录态 —— 删掉它们不影响 cookie/localStorage 的保留。
+     */
+    for (const stale of ['DevToolsActivePort', 'lockfile', 'SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+      try {
+        rmSync(join(profileDir, stale), { force: true })
+      } catch {
+        // 删不掉就交给下面的端口探测兜底（探测会跳过不可用的端口）
+      }
+    }
+    return
+  }
   if (existsSync(profileDir)) {
-    // 先收掉仍占着这个目录的旧浏览器，否则改名也会失败（Windows 上"
-    // 目录里有打开的文件"时 rename 同样被拒）。
+    // 损坏/半截 profile：仍用「先改名、再删旧名」的老办法，避免 EPERM 卡死启动。
     await waitForReclaim()
     let retired: string | undefined
     try {
@@ -334,6 +375,44 @@ async function prepareTransportProfile(
   } catch (error: any) {
     throw new Error(`创建 transport profile 失败：${error?.message ?? error}`)
   }
+}
+
+/**
+ * profile 是否"可用"（可复用）。
+ *
+ * 判据只认**结构性文件**，不去判断站点登录态（那是站点的事）：
+ * - `Local State`：Chromium 的 profile 元数据。**要求能被 JSON.parse 且非空** ——
+ *   只看"文件存在"会把崩溃时写坏的半截文件也判成可用（P1-4），
+ *   然后直接进复用分支、失去重建兜底，用户看到的是"重启后网页版起不来"。
+ * - `Default` 目录 + 其中至少一份页面数据（`Preferences` 或 `Cookies`）。
+ * 任一不过 ⇒ 按"需要初始化"处理（重建）。
+ */
+function profileLooksUsable(profileDir: string): boolean {
+  try {
+    const localStatePath = join(profileDir, 'Local State')
+    if (!existsSync(localStatePath)) return false
+    if (!existsSync(join(profileDir, 'Default'))) return false
+    const raw = readFileSync(localStatePath, 'utf8').trim()
+    if (raw.length === 0) return false
+    JSON.parse(raw) // 抛错即视为损坏
+    const defaultDir = join(profileDir, 'Default')
+    return existsSync(join(defaultDir, 'Preferences')) || existsSync(join(defaultDir, 'Cookies'))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 用例入口：只做 profile 准备（不 spawn 浏览器）。
+ *
+ * 导出它是为了让"复用 profile 但仍清掉旧句柄"这条判据能被离线反测 ——
+ * 直接调用 `launchBrowserTransport()` 会真的启动浏览器，不适合放进离线套件。
+ */
+export async function prepareTransportProfileForTest(
+  profileDir: string,
+  waitForReclaim: () => Promise<void> = async () => {},
+): Promise<void> {
+  await prepareTransportProfile(profileDir, waitForReclaim)
 }
 
 /** 等 profile 里的 DevToolsActivePort 出现并返回端口。 */

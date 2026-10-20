@@ -14,13 +14,16 @@
  */
 
 import type { FreetokenConfig } from '../config.js'
+import type { StatusSnapshot } from '../status.js'
 import { FreetokenError } from '../adapter/errors.js'
 import type { BackendRequest, ExecutionBackend, UploadImageInput } from './backend.js'
 import { readAuth, saveAuth, type StoredAuth } from './auth.js'
 import { acquireTransportLock } from './identity.js'
 import {
   invalidateTransportSession,
+  launchBrowserTransport,
   markTransportPageSessionStale,
+  navigateTransportToSite,
   noteTransportPageSessionSignature,
   readTransportCookieJar,
   readTransportPageState,
@@ -38,6 +41,10 @@ import {
   toWebAuthShape,
 } from './credential.js'
 import {
+  describeCredentialAge,
+  evaluateCredentialAge,
+} from './credential-age.js'
+import {
   browserAvailable,
   closeEgress,
   installBrowserEgress,
@@ -50,8 +57,10 @@ import {
   streamWebCompletion,
   uploadImageFile,
 } from './vendor/webapi.js'
+import { applyContextMode, readContextModeSetting } from './vendor/context-feed.js'
 import { createDeferredCleaner, type DeferredCleaner } from '../session/cleanup.js'
 import { removeJournalEntry, upsertJournalEntry } from '../session/journal.js'
+import { createTransportKeepAlive, type KeepAlive } from './keep-alive.js'
 
 export interface RealBackendDeps {
   logger?: { info?: (message: string) => void; warn?: (message: string) => void; debug?: (message: string) => void }
@@ -59,10 +68,27 @@ export interface RealBackendDeps {
   onAuthRefreshed?: (auth: StoredAuth) => void
   /** 自动续签也救不回来时回调（status 明确显示“需要重新登录”，而不是静默失败）。 */
   onAuthFailed?: (message: string) => void
+  /** 状态增量回填（常驻守护的面板可见性依赖它）。 */
+  onStatus?: (patch: Partial<StatusSnapshot>) => void
 }
 
 /** AUTH 后页面续签的等待上限（站点重启 + 自己刷新 token 的时间）。 */
 const AUTH_RENEW_TIMEOUT_MS = 15_000
+
+/**
+ * 预检续签失败后的冷却时间（P0-1）。
+ *
+ * 🔴 为什么必须有：预检失败时 `savedAt` **不会更新**，于是 `due` 状态会永久为真 ——
+ * 没有冷却就等于**每个请求前都整页重载一次**（比原来的"撞 401 再报错"更糟，
+ * 而且是最容易被风控识别的高频整页加载模式）。
+ *
+ * 冷却时长取「阈值的一半」与 10 分钟中的较大值：阈值越大说明凭证越老，
+ * 越不该频繁重试（同时也不该很快再试 —— 站点侧通常需要更久才能续上）。
+ */
+function preflightCooldownMs(thresholdMs: number): number {
+  const base = Math.max(10 * 60_000, Math.floor(Math.max(0, thresholdMs) / 2))
+  return Math.min(base, 60 * 60_000)
+}
 
 export function createRealBackend(config: FreetokenConfig, deps: RealBackendDeps = {}): ExecutionBackend {
   const logger = deps.logger
@@ -76,6 +102,17 @@ export function createRealBackend(config: FreetokenConfig, deps: RealBackendDeps
    * 请求前同步若采纳页面值就会把新登录“降级”回旧 token。等新凭证成功跑完一轮后再置回 true。
    */
   let pageCredentialTrusted = true
+  /** 常驻守护（S2.3–S2.5）；只在 start() 之后存在。 */
+  let keepAlive: KeepAlive | undefined
+  /** 预检续签失败后的冷却截止时刻（P0-1：防止每个请求都整页重载）。 */
+  let preflightCooldownUntil = 0
+  /**
+   * 本轮请求是否已经试过续签（含预检）。
+   *
+   * 用途：某一次请求里预检已经 reload 过一次，AUTH 恢复路径就**不要再 reload 第二次**
+   * ——否则一次请求最多三次整页重载，比不做预检还糟。
+   */
+  let renewalTriedThisTurn = false
 
   const createCleaner = (): DeferredCleaner =>
     createDeferredCleaner({
@@ -254,6 +291,30 @@ export function createRealBackend(config: FreetokenConfig, deps: RealBackendDeps
     // 传输层页面的 UA 必须与登录捕获一致。headless 的默认 UA 带 `HeadlessChrome`，
     // 与请求指纹/站点风控预期不一致（账号库 shim 让 vendor 的 UA 传递静默失效）。
     setTransportUserAgent(readAuth()?.auth?.userAgent)
+    // S1.1：投喂模式必须在第一次真实请求前落到 vendor 的运行时开关上。
+    // vendor 内部一律以 `currentContextMode()` 为准（池/链/轮换判据都读它），
+    // 只写配置不写这里等于没生效。
+    //
+    // ⚠️ 优先级（P2-2）：**落盘设置优先于配置**。
+    // vendor 提供了 `readContextModeSetting()`（设置页保存的用户的显式选择），
+    // 但它从没被调用过 ⇒ 配置会静默覆盖用户在面板上的选择。
+    // 语义：用户在面板选过 ⇒ 以面板为准；没选过 ⇒ 用配置（默认 chained）。
+    try {
+      const persisted = readContextModeSetting()
+      const effective = persisted ?? config.session.contextMode
+      applyContextMode(effective)
+      logger?.info?.(
+        effective === 'chained'
+          ? `freetoken: context feed = chained（只发增量；链式下不轮换会话，一个 DSH 会话长期对应同一网页会话）${
+              persisted ? ' [来自设置页]' : ' [来自配置]'
+            }`
+          : `freetoken: context feed = full（每轮全量重发，按 reuseTurns 轮换）${
+              persisted ? ' [来自设置页]' : ' [来自配置]'
+            }`,
+      )
+    } catch (error: any) {
+      logger?.warn?.(`freetoken: applying context mode failed: ${error?.message ?? error}`)
+    }
     installBrowserEgress()
     cleaner = createCleaner()
     // 上次强杀留下的“欠删除”账本：启动时补扫（keep 模式内部为 no-op）。
@@ -283,6 +344,44 @@ export function createRealBackend(config: FreetokenConfig, deps: RealBackendDeps
     } catch (error: any) {
       logger?.warn?.(`freetoken: session lifecycle hook unavailable: ${error?.message ?? error}`)
     }
+
+    // S2.3/S2.4/S2.5：起常驻守护（页面活着 ⇒ 站点自己的 JS 就会维持会话；
+    // 浏览器被误关 ⇒ 自动重新拉起；页面被导航走/丢登录态 ⇒ 本地自愈）。
+    try {
+      keepAlive ??= createTransportKeepAlive({
+        probe: readTransportPageState,
+        browserAvailable,
+        ensureStarted: async () => {
+          await launchTransportForKeepAlive()
+        },
+        navigateToSite: navigateTransportToSite,
+        markPageSessionStale: markTransportPageSessionStale,
+        invalidateSession: invalidateTransportSession,
+        requestsInFlight: transportRequestsInFlight,
+        onState: (state) => {
+          try {
+            deps.onStatus?.({
+              session: {
+                contextMode: config.session.contextMode,
+                persistent: config.session.contextMode === 'chained',
+                keepAliveState: state.state,
+                keepAliveRestarts: state.restarts,
+              },
+              // P2-1：浏览器实际状态必须跟着守护走，否则面板会显示 "running"
+              // 而浏览器其实已经死了（或已经被重启）—— 面板说谎比不显示更糟。
+              browser: { running: state.state !== 'dead', pid: null },
+            })
+          } catch {
+            // 观测失败不影响守护
+          }
+        },
+        ...(logger ? { logger } : {}),
+      })
+      keepAlive.start()
+    } catch (error: any) {
+      logger?.warn?.(`freetoken: keep-alive unavailable: ${error?.message ?? error}`)
+    }
+
     started = true
   }
 
@@ -292,6 +391,18 @@ export function createRealBackend(config: FreetokenConfig, deps: RealBackendDeps
       throw new FreetokenError('MISSING_CREDENTIAL', 'freetoken: not logged in; run `/freetoken login` first')
     }
     return auth
+  }
+
+  /**
+   * 常驻守护专用：只把浏览器拉起来（不做业务请求、不动锁/清理器）。
+   *
+   * 与 `start()` 的区别：守护是在"浏览器被误关"时恢复**会话载体**，
+   * 不该去重新获取单实例锁、也不该重复注册会话钩子（那些是一次性的）。
+   */
+  const launchTransportForKeepAlive = async (): Promise<void> => {
+    if (!browserAvailable()) throw new Error('freetoken: no Edge/Chrome found for keep-alive')
+    setTransportUserAgent(readAuth()?.auth?.userAgent)
+    await launchBrowserTransport()
   }
 
   return {
@@ -306,6 +417,36 @@ export function createRealBackend(config: FreetokenConfig, deps: RealBackendDeps
       // 请求前先把页面上的最新凭证同步进快照（页面优先，避免旧 token 覆盖新 token）。
       // 刚登录时页面还可能是旧凭证 ⇒ 不可信期间跳过采纳，等新凭证跑完一轮再恢复。
       const initial = requireAuth()
+      renewalTriedThisTurn = false
+
+      // S1.3 凭证年龄预检：快到期就先续签，别等任务跑到一半撞 401。
+      //
+      // 三重门（P0-1）：① 阈值命中；② 不在冷却期（上次续签失败后 10 分钟不再试）；
+      // ③ 预检真的失败 ⇒ 进冷却。没有 ②③ 的话 `savedAt` 不更新会让 due 永久为真，
+      // 变成"每个请求前整页重载一次"。
+      const ageVerdict = evaluateCredentialAge({
+        savedAt: initial.savedAt,
+        now: Date.now(),
+        thresholdMs: config.session.credentialRefreshAgeMs,
+      })
+      if (ageVerdict === 'due' && Date.now() >= preflightCooldownUntil) {
+        renewalTriedThisTurn = true
+        const age = Date.now() - initial.savedAt
+        logger?.info?.(`freetoken: credential pre-flight refresh (${describeCredentialAge(age)})`)
+        const preflight = await renewCredentialViaPage(initial, request.signal)
+        if (preflight) {
+          logger?.info?.('freetoken: pre-flight refresh renewed the credential before sending')
+        } else {
+          // 续不上就照旧发一次（真失效会由 AUTH 路径明确上报），但**进冷却**，
+          // 避免下一个请求又整页重载一次。
+          const cooldown = preflightCooldownMs(config.session.credentialRefreshAgeMs)
+          preflightCooldownUntil = Date.now() + cooldown
+          logger?.warn?.(
+            `freetoken: pre-flight refresh failed; sending with the current credential and cooling down for ${Math.round(cooldown / 60_000)}min`,
+          )
+        }
+      }
+
       const synced = pageCredentialTrusted ? await syncCredentialFromPage(initial) : undefined
       let currentAuth = toWebAuthShape(synced ?? initial)
 
@@ -373,7 +514,18 @@ export function createRealBackend(config: FreetokenConfig, deps: RealBackendDeps
         } catch (error: any) {
           const code = String(error?.code ?? '')
           // AUTH 只做一次“页面续签后重试”，且必须是本轮流尚未产出任何正文/思考内容时。
-          if (code === 'AUTH' && canAttemptAuthRecovery({ attempt, contentEmitted })) {
+          //
+          // 🔴 P0-1 的完整修法（复核指出）：冷却门必须**同时**管住 AUTH 恢复路径。
+          // 否则预检失败 → `savedAt` 不更新 → `due` 永久为真，而 AUTH 恢复路径每轮都
+          // 重置 `renewalTriedThisTurn` 且不受冷却约束 ⇒ 每个请求仍会整页 reload 一次
+          // （"每请求整页重载"只是从预检挪到了 AUTH 路径，没有真正消除）。
+          if (
+            code === 'AUTH' &&
+            !renewalTriedThisTurn &&
+            Date.now() >= preflightCooldownUntil &&
+            canAttemptAuthRecovery({ attempt, contentEmitted })
+          ) {
+            renewalTriedThisTurn = true
             const source = readAuth()
             if (source?.auth?.token) {
               const adopted = pageCredentialTrusted ? await syncCredentialFromPage(source) : undefined
@@ -385,6 +537,8 @@ export function createRealBackend(config: FreetokenConfig, deps: RealBackendDeps
                 currentAuth = toWebAuthShape(renewed)
                 continue
               }
+              // 续签失败 ⇒ 同样进冷却：否则下一个请求又会整页重载一次。
+              preflightCooldownUntil = Date.now() + preflightCooldownMs(config.session.credentialRefreshAgeMs)
             }
           }
           if (code === 'AUTH') {
@@ -459,7 +613,13 @@ export function createRealBackend(config: FreetokenConfig, deps: RealBackendDeps
     },
 
     async close() {
-      // 收尾：把待删队列刷一遍（失败会留在 journal 里给下次启动补删），再关浏览器。
+      // 收尾：先停守护（否则关浏览器时它会把浏览器又拉起来），再刷账本、关浏览器。
+      try {
+        keepAlive?.stop()
+      } catch {
+        // 忽略
+      }
+      keepAlive = undefined
       try {
         setTransportIdleHook(undefined)
       } catch {

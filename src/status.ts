@@ -30,6 +30,25 @@ export interface StatusSnapshot {
     loggedIn: boolean
     lastVerifiedAt: number | null
     lastError: string | null
+    /**
+     * 凭证快照年龄（ms）；未知为 null（S1.4）。
+     *
+     * 刻意设为**可选**：`status.update()` 对嵌套对象是整体替换，若设成必填，
+     * 每个只关心登录态的调用点都要重复填一遍，容易填错或忘更新。
+     * 由 `refreshCredentialAge()` 统一写入。
+     */
+    credentialAgeMs?: number | null
+  }
+  /** 会话所有权/投喂模式（S1.4 / S2）：面板据此显示"后台会话是否常驻"。 */
+  session: {
+    /** 上下文投喂方式。 */
+    contextMode: 'full' | 'chained'
+    /** 链式投喂下会话不轮换 ⇒ 一个 DSH 会话长期对应同一条网页版会话。 */
+    persistent: boolean
+    /** 传输层常驻守护最近一次判定。 */
+    keepAliveState: 'idle' | 'alive' | 'logged-out' | 'off-origin' | 'dead'
+    /** 守护累计重启浏览器次数（误关自愈的证据）。 */
+    keepAliveRestarts: number
   }
   identity: {
     deviceId: string | null
@@ -92,7 +111,13 @@ export function disabledSnapshot(config: FreetokenConfig): StatusSnapshot {
     enabled: config.enabled,
     started: false,
     phase: 'idle',
-    login: { loggedIn: false, lastVerifiedAt: null, lastError: null },
+    login: { loggedIn: false, lastVerifiedAt: null, lastError: null, credentialAgeMs: null },
+    session: {
+      contextMode: config.session.contextMode,
+      persistent: config.session.contextMode === 'chained',
+      keepAliveState: 'idle',
+      keepAliveRestarts: 0,
+    },
     identity: { deviceId: null, backend: config.backend, singleInstance: config.identity.singleInstance },
     browser: { running: false, pid: null },
     lock: { held: false, heldBy: null, heldMs: 0 },
@@ -134,12 +159,36 @@ export interface StatusStore {
   snapshot(): StatusSnapshot
 }
 
-/** 创建内存状态存储；深拷贝出口，避免调用方改到内部对象。 */
+/**
+ * 创建内存状态存储；深拷贝出口，避免调用方改到内部对象。
+ *
+ * ⚠️ 嵌套对象**浅合并**（`{...current.session, ...patch.session}`），
+ * 不是整体替换 —— 整体替换会让"只写一个子字段"的调用点把同级的其它字段抹掉。
+ *
+ * 这个坑真实发生过：`onAuthRefreshed` 只写 `login.loggedIn/lastVerifiedAt/lastError`，
+ * 整体替换会把 `login.credentialAgeMs` 抹成 undefined；`session` 同理
+ * （keep-alive 只写 keepAlive* 两个字段，却会抹掉 contextMode/persistent）。
+ * 浅合并让每个写入方只声明自己关心的子字段。
+ */
 export function createStatusStore(initial: StatusSnapshot): StatusStore {
   let current: StatusSnapshot = structuredClone(initial)
   return {
     update(patch) {
-      current = { ...current, ...structuredClone(patch), updatedAt: Date.now() }
+      const cloned = structuredClone(patch)
+      const next: StatusSnapshot = { ...current, ...cloned, updatedAt: Date.now() }
+      // 嵌套浅合并：只覆盖 patch 里**显式给出**的子字段。
+      if (cloned.login) next.login = { ...current.login, ...cloned.login }
+      if (cloned.session) next.session = { ...current.session, ...cloned.session }
+      if (cloned.rhythm) next.rhythm = { ...current.rhythm, ...cloned.rhythm }
+      if (cloned.safety) next.safety = { ...current.safety, ...cloned.safety }
+      if (cloned.retry) next.retry = { ...current.retry, ...cloned.retry }
+      if (cloned.lock) next.lock = { ...current.lock, ...cloned.lock }
+      if (cloned.queue) next.queue = { ...current.queue, ...cloned.queue }
+      if (cloned.browser) next.browser = { ...current.browser, ...cloned.browser }
+      if (cloned.identity) next.identity = { ...current.identity, ...cloned.identity }
+      if (cloned.narration) next.narration = { ...current.narration, ...cloned.narration }
+      if (cloned.metrics) next.metrics = { ...current.metrics, ...cloned.metrics }
+      current = next
     },
     snapshot() {
       return structuredClone(current)

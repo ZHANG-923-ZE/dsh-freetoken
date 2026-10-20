@@ -26,7 +26,11 @@ function renderStatus(snapshot: StatusSnapshot, config: FreetokenConfig): string
     `started: ${snapshot.started} | phase: ${snapshot.phase} | backend: ${snapshot.identity.backend}`,
     `login: ${snapshot.login.loggedIn ? 'logged-in' : 'not-logged-in'}${
       snapshot.login.lastError ? ` (${snapshot.login.lastError})` : ''
-    }`,
+    }` + ` | credential-age: ${age(snapshot.login.credentialAgeMs ?? null)}`,
+    `session: mode=${snapshot.session.contextMode}` +
+      `${snapshot.session.persistent ? ' (persistent: 1 DSH session = 1 web session)' : ' (rotates)'}` +
+      ` | keep-alive=${snapshot.session.keepAliveState}` +
+      `${snapshot.session.keepAliveRestarts > 0 ? ` | restarts=${snapshot.session.keepAliveRestarts}` : ''}`,
     `identity: device=${snapshot.identity.deviceId ?? 'n/a'} | singleInstance=${snapshot.identity.singleInstance}`,
     `browser: ${snapshot.browser.running ? `running pid=${snapshot.browser.pid ?? '?'}` : 'stopped'}`,
     `lock: ${snapshot.lock.held ? `held ${snapshot.lock.heldMs}ms` : 'free'}` +

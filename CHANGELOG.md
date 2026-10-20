@@ -1,5 +1,54 @@
 # Changelog
 
+## 2026-10-20 · 0.4.0（会话所有权：上下文经济 + 常驻会话）
+
+路线正本：`8.12.1.3-Session-Ownership-Route.md`。目标：把“凭证快照 + 跨浏览器重放”
+改成“单一会话本体”，并让上下文成本不再随对话线性增长。
+
+### 批次一 · 上下文经济
+
+- **默认投喂改为 `chained`**（`session.contextMode`）：每轮只发增量 + `parent_message_id`，
+  不再每轮重发全量（实测旧行为单轮 21 万字符）。实测依据与代价见 `vendor/context-feed.ts`；
+  遇到不确定会自动退回全量重发（既有兜底）。
+- 链式模式下 `effectiveReuseLimit` 返回无限 ⇒ **一个 DSH 会话永久对应一条网页版会话**
+  （不再每 20 轮轮换）。改回 `full` 即恢复旧行为（可回退）。
+- 新增 `credential-age.ts`：请求前按 `auth.json` 的 `savedAt` 判断是否临近寿命
+  （默认 90 分钟）。到期前主动续签，把“任务中途撞 401”改成“开始前就处理”。
+  续签失败仍照常发送（真失效由 AUTH 路径明确上报，不静默吞掉）。
+- status/`/freetoken status` 新增 `credentialAgeMs`、`session.contextMode`、
+  `session.persistent`、`session.keepAliveState/Restarts`（面板可见）。
+
+### 批次二 · 会话所有权
+
+- **传输层 profile 不再每次重建**（`prepareTransportProfile`）：存在可用 profile 就复用，
+  站点写给这个浏览器的活状态（cookie/localStorage）得以跨启动保留 —— 这是“会话常驻”
+  的物理前提，也是消除“快照 TTL 一到就断”的关键。
+- 复用分支会清掉**旧运行时句柄**（`DevToolsActivePort` / `lockfile` / `Singleton*`）：
+  不清会连到已退出的浏览器端口，或被 Chromium 误判“已有实例”而交接后自杀。
+  只删句柄，**不动** cookie/localStorage。
+- 新增 `keep-alive.ts`：常驻守护（本地 CDP 探测，**零网络**），四态判据
+  alive/off-origin/logged-out/dead：
+  - 页面被导航走 ⇒ 拉回站点 origin；
+  - 页面丢登录态 ⇒ 作废安装签名，下一次请求自动重装；
+  - 浏览器不可用（含被误关）⇒ 连续 N 次失败后自动重新拉起（**误触自愈**）。
+  间隔带抖动（60s×[0.7,1.3]），不造固定周期流量。
+- 守护在 `close()` 先停，避免关浏览器时又被拉起来。
+
+### 验证
+
+- 构建 0 错；离线 **33/33 PASS**（新增 `check-context-mode`、`check-keep-alive`、
+  `check-lazy-concurrency`，另扩展 `check-status-shape` 与 `check-disabled-audit`）。
+- 三轮独立只读复核（变异测试在系统临时目录进行，未碰工作区）后修掉的 P0：
+  - 预检无冷却 ⇒ 每请求整页重载（`savedAt` 不更新使 `due` 永久为真）；
+  - AUTH 恢复路径绕过冷却门 ⇒ 整页重载只是从预检挪到了 AUTH 路径；
+  - 预热与首个请求并发 ⇒ `lazy-backend` 创建两个后端、**自撞单实例锁**（首请求必现失败）；
+  - keep-alive 判死时杀浏览器 ⇒ 掐断正在流式输出的回答；
+  - 预热在 `apply()` 同步段加载重模块 ⇒ 破坏"enabled-idle 零重模块"性质。
+- 复核还修掉的 P1：keep-alive 状态不回填面板、`status` 嵌套对象整体覆盖导致字段互相抹掉、
+  重启失败无退避、复用 profile 时未等待旧浏览器退出、profile 判据过宽、
+  投喂模式覆盖用户在设置页的显式选择、浏览器运行状态面板说谎。
+- 未做：真实链路长跑（需用户手动测试）；真实 401 → 页面续签的端到端观察。
+
 ## 0.1.0 — 2026-10-20（P0 脚手架）
 
 - 项目落位：`8.12-Freetoken`，代码仓 `8.12.4-Src`，包名 `dsh-freetoken`。

@@ -14,6 +14,7 @@ import { createStatusStore, disabledSnapshot, type StatusStore } from './status.
 import { loadedKeysSnapshot, onLazyLoaded } from './lazy/load.js'
 import { clearAuth, maskToken, readAuth, saveAuth, type StoredAuth } from './transport/auth.js'
 import { adoptPageCredential, classifyCredentialFailure } from './transport/credential.js'
+import { credentialAgeMs } from './transport/credential-age.js'
 import { probeAuth, type ProbeResult } from './transport/probe.js'
 import type { FreetokenOps } from './commands.js'
 import { ensureLazy } from './lazy/load.js'
@@ -123,6 +124,23 @@ export function createRuntime(
   const getAuth = overrides.getAuth ?? (() => readAuth())
 
   /**
+   * 把凭证年龄写进 status（S1.4）。
+   *
+   * 为什么不塞进每个 login patch：`status.update()` 对嵌套对象是整体替换，
+   * 每个调用点都重复填一遍容易漏/填错。这里统一从 `auth.json` 现算。
+   */
+  const refreshCredentialAge = (): void => {
+    try {
+      const auth = overrides.getAuth ? overrides.getAuth() : readAuth()
+      const age = credentialAgeMs(auth?.savedAt, Date.now())
+      const snapshot = status.snapshot()
+      status.update({ login: { ...snapshot.login, credentialAgeMs: age } })
+    } catch {
+      // 观测失败不影响主流程
+    }
+  }
+
+  /**
    * 探活/登录拿到可信身份后回填稳定账号 id。
    *
    * 为什么必须回填：vendor 的会话槽/投喂链归属键优先用 `user.id`；没有它就只能退回
@@ -148,6 +166,8 @@ export function createRuntime(
     }
   }
   let adapterDisposer: (() => void) | undefined
+  /** 凭证年龄刷新定时器的清理函数（dispose 时必须停，避免宿主退出后仍挂着）。 */
+  let ageDisposer: (() => void) | undefined
   let started = false
   let disposed = false
 
@@ -309,7 +329,7 @@ export function createRuntime(
         // 清理失败不影响退出结果
       }
       status.update({
-        login: { loggedIn: false, lastVerifiedAt: null, lastError: null },
+        login: { loggedIn: false, lastVerifiedAt: null, lastError: null, credentialAgeMs: null },
         safety: { testAccountOnly: config.safety.testAccountOnly, mutedUntil: null, halted: false, haltReason: null },
       })
       return { ok: true, message: removed ? 'freetoken: credentials cleared' : 'freetoken: no credentials stored' }
@@ -430,6 +450,51 @@ export function createRuntime(
       }
 
       status.update({ started: true, phase: 'idle' })
+      refreshCredentialAge()
+
+      /**
+       * S2.3：启用且已有凭证时**主动把传输层会话拉起来**（不再等第一次请求）。
+       *
+       * 为什么这对"登录态稳定"是关键：站点维持会话靠的是它自己网页里的 JS 一直在跑
+       * （轮询/活动）。以前只有发请求才启动浏览器，空闲时段页面不在线 —— 会话冷却、
+       * 下一次请求前就得重新“冒充”登录。现在启用即常驻。
+       *
+       * 约束：只在 enabled 且**有凭证**时触发；失败只记日志、不影响启动（首次请求会再试）。
+       * 必须经 `lazy` 后端（重模块），且不阻塞 start()。
+       */
+      if (config.autoStartWarmSession) {
+        // 🔴 预热必须**异步**（不阻塞 start 的同步段）：否则 `apply()` 返回时
+        // 重模块已经被加载，`check-disabled-audit` 的"enabled-idle 不加载任何重模块"
+        // 断言就会在**有凭证的真实环境**下变红（离线用例无凭证才侥幸通过）。
+        // 让出一个微任务即可把加载推迟到 start() 之后。
+        setTimeout(() => {
+          void (async () => {
+            try {
+              // 插件可能在这之前已被卸载（dispose）⇒ 不得再把浏览器拉起来。
+              if (disposed) return
+              const auth = readAuth()
+              if (!auth?.auth?.token) return
+              await backend.start()
+              if (disposed) return
+              status.update({ browser: { running: true, pid: null } })
+              ctx.logger?.info?.('freetoken: transport session warmed up (background keep-alive active)')
+            } catch (error: any) {
+              ctx.logger?.warn?.(`freetoken: warm-up skipped (${error?.message ?? error})`)
+            }
+          })()
+        }, 0)
+      }
+
+      /**
+       * 凭证年龄写进 status（S1.4）。
+       *
+       * 放在这里而不是每个 login patch 里：`status.update()` 的嵌套对象是**浅合并**，
+       * 只写 `login.loggedIn` 不会抹掉 `credentialAgeMs`；但年龄需要**随时间推移自己变旧**，
+       * 所以要在面板轮询时刷新，而不是只在启动时算一次。
+       */
+      const ageTimer = setInterval(() => refreshCredentialAge(), 60_000)
+      ;(ageTimer as any).unref?.()
+      ageDisposer = () => clearInterval(ageTimer)
 
       // host status API（面板消费；只在启用态注册，关闭态零副作用）。
       const registerStatusApi = (scope: any): void => {
@@ -460,7 +525,8 @@ export function createRuntime(
 
       ctx.logger?.info?.(
         `freetoken: enabled (provider=${PROVIDER}, transport=${config.transport}, backend=${backend.kind}, ` +
-          `narration=${config.narration.enabled}, localTitle=${config.localTitle.enabled})`,
+          `narration=${config.narration.enabled}, localTitle=${config.localTitle.enabled}, ` +
+          `contextFeed=${config.session.contextMode})`,
       )
     },
 
@@ -468,6 +534,12 @@ export function createRuntime(
       if (disposed) return
       disposed = true
       started = false
+      try {
+        ageDisposer?.()
+      } catch {
+        // 清理失败不阻塞卸载
+      }
+      ageDisposer = undefined
       try {
         adapterDisposer?.()
       } catch {

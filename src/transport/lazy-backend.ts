@@ -19,6 +19,7 @@ interface RealBackendModule {
       logger?: any
       onAuthRefreshed?: (auth: StoredAuth) => void
       onAuthFailed?: (message: string) => void
+      onStatus?: (patch: Partial<StatusSnapshot>) => void
     },
   ): ExecutionBackend
 }
@@ -48,23 +49,44 @@ export interface LazyBackendDeps {
 
 export function createLazyBackend(config: FreetokenConfig, deps: LazyBackendDeps = {}): ExecutionBackend {
   let real: ExecutionBackend | undefined
+  /**
+   * 正在加载中的 promise（P0 修复）。
+   *
+   * 🔴 为什么必须记"加载中"而不只是"已完成"：
+   * `autoStartWarmSession` 的预热会调 `backend.start()`，**同时**第一个真实请求会调
+   * `backend.stream()` —— 两者都走 `load()`。旧写法只在 `real` 已就绪时复用，
+   * 于是并发时会**创建两个 real-backend**，而 real-backend 的 `start()` 会去拿
+   * **单实例锁** ⇒ 第二个实例报 `another transport instance is running (pid=<自己的 pid>)`
+   * ⇒ 首次请求直接失败（首请求必现的时序，不是罕见竞态）。
+   */
+  let loading: Promise<ExecutionBackend> | undefined
 
   const load = async (): Promise<ExecutionBackend> => {
     if (real) return real
-    const realModule = await ensureLazy<RealBackendModule>('transport/real-backend')
-    const inner = realModule.createRealBackend(config, {
-      logger: deps.logger,
-      ...(deps.onAuthRefreshed ? { onAuthRefreshed: deps.onAuthRefreshed } : {}),
-      ...(deps.onAuthFailed ? { onAuthFailed: deps.onAuthFailed } : {}),
-    })
-    const rhythmModule = await ensureLazy<RhythmBackendModule>('rhythm/backend')
-    real = rhythmModule.createRhythmBackend(inner, config, {
-      onStatus: deps.onStatus,
-      onMetric: deps.onMetric,
-      logger: deps.logger,
-      ...(deps.initialTodayRequests !== undefined ? { initialTodayRequests: deps.initialTodayRequests } : {}),
-    })
-    return real
+    loading ??= (async () => {
+      const realModule = await ensureLazy<RealBackendModule>('transport/real-backend')
+      const inner = realModule.createRealBackend(config, {
+        logger: deps.logger,
+        ...(deps.onAuthRefreshed ? { onAuthRefreshed: deps.onAuthRefreshed } : {}),
+        ...(deps.onAuthFailed ? { onAuthFailed: deps.onAuthFailed } : {}),
+        // 常驻守护的状态要能回到面板（否则 /freetoken status 永远显示 idle）。
+        ...(deps.onStatus ? { onStatus: deps.onStatus } : {}),
+      })
+      const rhythmModule = await ensureLazy<RhythmBackendModule>('rhythm/backend')
+      return rhythmModule.createRhythmBackend(inner, config, {
+        onStatus: deps.onStatus,
+        onMetric: deps.onMetric,
+        logger: deps.logger,
+        ...(deps.initialTodayRequests !== undefined ? { initialTodayRequests: deps.initialTodayRequests } : {}),
+      })
+    })()
+    try {
+      real = await loading
+      return real
+    } finally {
+      // 失败也要清掉 loading：否则一次失败会被永久缓存，后续请求永远拿不到后端。
+      loading = undefined
+    }
   }
 
   return {

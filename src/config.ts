@@ -22,6 +22,17 @@ export interface FreetokenConfig {
   enabled: boolean
   mode: Mode
   autoStartBrowser: boolean
+  /**
+   * 启用后是否**主动预热传输层会话**（S2.3，2026-10-20）。
+   *
+   * `true`（默认）：启用且已有凭证时就把后台浏览器拉起来常驻，由站点自己的 JS
+   * 维持会话 —— 这是“后台网页版登录一直在”的实现前提。
+   * `false`：退回旧行为（第一次真实请求才懒启动）。
+   *
+   * ⚠️ 与 `autoStartBrowser` 的分工：后者是历史字段、当前无使用点；
+   * 本字段是**实际生效**的开关（语义明确为“预热常驻会话”）。
+   */
+  autoStartWarmSession: boolean
   captureLoginOnStart: boolean
   /** 仅 browser：PoW 必须在真实浏览器页内完成，禁止 Node 侧回退。 */
   transport: 'browser'
@@ -85,6 +96,25 @@ export interface FreetokenConfig {
   session: {
     reuseTurns: number
     maxSlots: number
+    /**
+     * 上下文投喂方式（S1.1，2026-10-20）。
+     *
+     * - `full`：每轮重发完整 prompt。最稳，但请求体随对话线性增长
+     *   （实测单轮 21 万字符），且受 `reuseTurns` 轮换。
+     * - `chained`：只发增量 + `parent_message_id` 让服务端维护上下文。请求体小、
+     *   更像真人连续对话，且 vendor 侧 `effectiveReuseLimit` 在链式下返回无限
+     *   ⇒ **一个 DSH 会话永久对应一条网页版会话**（不轮换）。
+     * 默认值由 `DEFAULT_CONTEXT_MODE` 决定（当前 chained）；运行时以
+     * vendor 的 `currentContextMode()` 为准，本字段只是配置入口。
+     */
+    contextMode: 'full' | 'chained'
+    /**
+     * 凭证年龄预检阈值（ms，S1.3）。
+     *
+     * 超过它就先在页面上试着续签一次，而不是等请求撞 401。`0` = 关闭预检
+     * （回退到“只在 AUTH 时恢复”的旧行为）。
+     */
+    credentialRefreshAgeMs: number
     cleanup: 'deferred' | 'keep'
     cleanupBatch: Range
     cleanupDelayMs: Range
@@ -106,6 +136,7 @@ export const DEFAULT_CONFIG: FreetokenConfig = Object.freeze({
   enabled: false,
   mode: 'dev',
   autoStartBrowser: false,
+  autoStartWarmSession: true,
   captureLoginOnStart: false,
   transport: 'browser',
   backend: 'cdp',
@@ -132,6 +163,10 @@ export const DEFAULT_CONFIG: FreetokenConfig = Object.freeze({
   session: {
     reuseTurns: 20,
     maxSlots: 6,
+    // S1.1：默认链式投喂 —— 请求体从“每轮全量”降为增量，且链式下不轮换会话
+    // （一个 DSH 会话 ↔ 一条网页版会话，长期复用）。改回 'full' 即恢复旧行为。
+    contextMode: 'chained',
+    credentialRefreshAgeMs: 90 * 60 * 1000,
     cleanup: 'deferred',
     cleanupBatch: { min: 6, max: 10 },
     cleanupDelayMs: { min: 60000, max: 120000 },
@@ -230,6 +265,11 @@ export function normalizeConfig(raw: unknown): FreetokenConfig {
     enabled: readBool(source, 'enabled', DEFAULT_CONFIG.enabled),
     mode: readEnum(source, 'mode', DEFAULT_CONFIG.mode, ['dev', 'stable']),
     autoStartBrowser: readBool(source, 'autoStartBrowser', DEFAULT_CONFIG.autoStartBrowser),
+    autoStartWarmSession: readBool(
+      source,
+      'autoStartWarmSession',
+      DEFAULT_CONFIG.autoStartWarmSession,
+    ),
     captureLoginOnStart: readBool(source, 'captureLoginOnStart', DEFAULT_CONFIG.captureLoginOnStart),
     // R14/R21：只允许真实浏览器路径；任何其它值回落 browser。
     transport: readEnum(source, 'transport', DEFAULT_CONFIG.transport, ['browser']),
@@ -330,6 +370,17 @@ export function normalizeConfig(raw: unknown): FreetokenConfig {
     session: {
       reuseTurns: readInt(session, 'reuseTurns', DEFAULT_CONFIG.session.reuseTurns, 0, 1000),
       maxSlots: readInt(session, 'maxSlots', DEFAULT_CONFIG.session.maxSlots, 1, 64),
+      contextMode: readEnum(session, 'contextMode', DEFAULT_CONFIG.session.contextMode, [
+        'full',
+        'chained',
+      ]),
+      credentialRefreshAgeMs: readInt(
+        session,
+        'credentialRefreshAgeMs',
+        DEFAULT_CONFIG.session.credentialRefreshAgeMs,
+        0,
+        6 * 3600 * 1000,
+      ),
       cleanup: readEnum(session, 'cleanup', DEFAULT_CONFIG.session.cleanup, ['deferred', 'keep']),
       cleanupBatch: readRange(session, 'cleanupBatch', DEFAULT_CONFIG.session.cleanupBatch, {
         min: 1,

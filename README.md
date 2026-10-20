@@ -123,7 +123,20 @@ desktop profile 安装前先备份 `package.json / pnpm-lock.yaml / cordis.patch
       dailyBudget: 0                        # 0 = 不限制
     retry: { maxRetries: 3, baseDelayMs: 5000, factor: 2, maxDelayMs: 120000, jitterRatio: 0.3 }
     safety: { testAccountOnly: true, haltOnMute: true }
-    session: { reuseTurns: 20, cleanup: deferred }
+    session:
+      reuseTurns: 20
+      cleanup: deferred
+      # 上下文投喂方式（0.4.0 起默认 chained）
+      #   chained：每轮只发增量，且**不轮换会话** ⇒ 一个 DSH 会话长期对应同一条网页版会话。
+      #            代价：工具协议只存在于链首那条消息里，服务端丢早期上下文时模型可能不按
+      #            约定格式发工具调用（插件遇不确定会自动退回全量重发）。
+      #   full   ：每轮重发全量，最稳但请求体随对话线性增长（实测单轮可达 21 万字符）。
+      contextMode: chained
+      # 凭证年龄预检（0 = 关闭）。超过它就先用页面续签一次，避免任务中途撞 401。
+      credentialRefreshAgeMs: 5400000
+    # 启用且已有凭证时预热并常驻传输层会话（站点自己的 JS 会维持登录态）。
+    # false = 退回旧行为（第一次真实请求才懒启动）。
+    autoStartWarmSession: true
 ```
 
 ## 命令
@@ -142,6 +155,25 @@ desktop profile 安装前先备份 `package.json / pnpm-lock.yaml / cordis.patch
 - 凭证不进仓库/日志/prompt；日志只出现掩码。
 - 默认节奏：发送前 2–5s 对数正态抖动、失败 5s 起指数退避+抖动、AUTH/mute/QUOTA 不重试、
   每 20 次请求后 30–60s 静默。出现 `AUTH`/mute 立即停止，不自动换号。
+
+## 会话常驻与登录态（0.4.0）
+
+这一版把“凭证快照 + 跨浏览器重放”改成“单一会话本体”，目的是让后台的网页版登录
+**持续在线**，而不是到点就断：
+
+- **传输层 profile 不再每次重建**：站点写给这个浏览器的 cookie/localStorage 会跨启动保留
+  （只清运行时句柄 `DevToolsActivePort` / `lockfile` / `Singleton*`，不动登录态）。
+- **`autoStartWarmSession`**：启用且已有凭证时就把后台浏览器拉起来常驻，由站点自己的 JS
+  维持会话（不再等第一次请求）。设 `false` 可退回旧的懒启动行为。
+- **常驻守护（keep-alive）**：每 60s×[0.7,1.3] 做一次**本地 CDP 探测（零网络）**，
+  判定 alive / off-origin / logged-out / dead：
+  - 页面被导航走 ⇒ 拉回站点（同一情况最多试 2 次）；
+  - 页面丢登录态 ⇒ 作废页面签名，下一次请求自动重装；
+  - 浏览器被关掉/崩了 ⇒ 连续 3 次探测失败后**自动重新拉起**（误关也能自愈），
+    失败按 60s×2ⁿ 退避（上限 30 分钟），连续 5 次仍失败则停表等下一次真实请求；
+  - ⚠️ **有请求在飞时绝不重启浏览器**（否则会掐断正在输出的回答）。
+- **`/freetoken status`** 会显示 `session: mode=... | keep-alive=...`，
+  面板可据此判断“后台会话是否常驻”。
 
 ## 懒加载与关闭态
 

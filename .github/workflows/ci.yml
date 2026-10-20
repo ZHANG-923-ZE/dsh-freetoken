@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (tsc -> lib/)
+        run: npm run build
+
+      - name: Offline checks
+        run: npm test
+
+      - name: Verify lib output exists
+        shell: bash
+        run: test -f lib/index.js && test -f lib/client.js
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-freetoken-lib-${{ matrix.os }}
+          path: lib/
+          retention-days: 7

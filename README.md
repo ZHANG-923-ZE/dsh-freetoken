@@ -23,6 +23,15 @@ Unofficial DSH plugin that bridges **chat.deepseek.com web** into DeepSeek Harne
 
 > 验证口径为作者本地环境的最后一次实测记录，不构成对所有环境的保证。
 
+## 环境要求
+
+| 项 | 要求 |
+|---|---|
+| DSH | Desktop 0.2.1-rc.2 或更新 |
+| Node | `^22.18.0 \|\| >=24.11.0` |
+| 浏览器 | Edge 或 Chrome（需支持 CDP；登录与 PoW 求解都在真实浏览器页内完成） |
+| 平台 | Windows x64 已实测；macOS / Linux 未实测 |
+
 ## 构建与测试
 
 ```powershell
@@ -31,11 +40,58 @@ node scripts/build.mjs
 node tests/run-offline.mjs
 ```
 
-## 安装（隔离 profile 示例）
+## 安装
+
+插件可从 **GitHub 地址**、**本地目录**或 **npm 包名**三种方式安装（DSH 的
+`dsh plugin add` / 设置页「添加插件」均支持）。
+
+### 方式一：从 GitHub 安装（推荐，无需手动构建）
+
+```powershell
+dsh plugin --profile freetoken-web add https://github.com/ZHANG-923-ZE/dsh-freetoken
+```
+
+DSH 会自行 clone 并以 pnpm 安装该仓库（仓库根即 npm 包根，`main` 分支为默认分支）。
+
+### 方式二：本地目录安装
+
+```powershell
+git clone https://github.com/ZHANG-923-ZE/dsh-freetoken.git
+cd dsh-freetoken
+npm install
+node scripts/build.mjs        # 必须先构建：lib/ 是产物，不入库
+dsh plugin --profile freetoken-web add "link:<你的绝对路径>\dsh-freetoken"
+```
+
+> `lib/` 不在版本库里（见 `.gitignore`），所以走本地目录时**必须先跑一次构建**，
+> 否则插件装上后没有 `lib/index.js` 可加载。
+
+### 方式三：桌面端图形界面
+
+DSH 设置 → 插件 → 「添加插件」，输入框直接填
+`https://github.com/ZHANG-923-ZE/dsh-freetoken`（界面接受包名 / GitHub 仓库地址 / 本地目录路径）。
+
+### 启用
+
+插件**默认关闭**（`enabled: false`，零副作用）。启用有两种方式：
+
+- 在 profile 的 `cordis.patch.yml` 里覆盖：
+
+  ```yaml
+  - id: freetoken
+    config:
+      enabled: true
+  ```
+
+- 或在 DSH 设置 → `dsh-Freetoken` 面板中启用（面板本身在关闭态也可打开，用于查看状态）。
+
+启用后用 `/freetoken login` 完成登录（见下方「命令」）。
+
+### 隔离 profile（推荐先用隔离环境试跑）
 
 ```powershell
 $env:DSH_HOME="C:\Users\<you>\AppData\Local\Temp\freetoken-test-home"
-dsh plugin --profile freetoken-web add "link:<path-to-this-repo>"
+dsh plugin --profile freetoken-web add https://github.com/ZHANG-923-ZE/dsh-freetoken
 # 在 profile 的 cordis.patch.yml 里 - id: freetoken config.enabled: true
 dsh --profile freetoken-web --no-open --port 61888
 ```
@@ -114,3 +170,19 @@ Apache-2.0，衍生自 `cv-superding/dsh-deepseek-web-login`（Apache-2.0，comm
 - 改动请保持既有工程约束：关闭态零副作用、重模块只能经 `src/lazy/load.ts` 懒加载、
   日志前缀统一 `freetoken:`、`transport/egress.ts` 是唯一 `fetch` 出口。
 - 提交前请跑通 `node scripts/build.mjs` 与 `node tests/run-offline.mjs`。
+- 完整工程约定见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
+- **安全问题请勿公开开 issue**，见 [`SECURITY.md`](SECURITY.md)（含私下报告渠道）。
+
+## 仓库结构
+
+```
+src/            TypeScript 源码（按 adapter / protocol / rhythm / session / transport 分层）
+  lazy/load.ts  唯一的动态 import 入口（重模块懒加载边界）
+  transport/vendor/  来自上游基座的衍生代码，署名见该目录 NOTICE.md
+tests/          离线用例（check-*.mjs），总入口 run-offline.mjs
+scripts/build.mjs      tsc 逐文件 ESM 构建到 lib/
+.github/workflows/ci.yml   CI：ubuntu + windows 构建与测试
+```
+
+CI 在每次 push / PR 时自动跑 `npm ci` → `npm run build` → `npm test`，
+Windows 与 Linux 双平台。

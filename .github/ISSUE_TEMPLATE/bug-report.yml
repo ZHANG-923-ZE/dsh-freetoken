@@ -1,0 +1,49 @@
+name: Bug report
+description: 报告一个可复现的问题
+labels: bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **请勿在此粘贴任何凭证**（token / cookie / 账号信息）。
+        提交前请自行掩码 `freetoken:` 前缀日志中的敏感片段。
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 实际观察到的行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望的行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 登录 /freetoken login
+        2. 发送一条消息
+        3. 观察面板状态
+    validations:
+      required: true
+
+  - type: input
+    id: env
+    attributes:
+      label: 环境
+      placeholder: DSH 版本 / Node 版本 / 操作系统 / 浏览器版本
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 掩码后的日志片段
+      render: text

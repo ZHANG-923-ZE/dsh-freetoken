@@ -19,7 +19,7 @@ Unofficial DSH plugin that bridges **chat.deepseek.com web** into DeepSeek Harne
 | 配置命名空间 / 日志前缀 | `freetoken` / `freetoken:` |
 | 默认 | `enabled: false`（零副作用） |
 | 构建 | tsc → `lib/`（逐文件 ESM，保留懒加载边界）；client 面板同目录 classic script |
-| 验证 | 构建 0 错；离线 29/29；真实 E2E：文本/文件读写+grep/图片理解 |
+| 验证 | 构建 0 错；离线 30/30；真实 E2E：文本/文件读写+grep/图片理解 |
 
 > 验证口径为作者本地环境的最后一次实测记录，不构成对所有环境的保证。
 

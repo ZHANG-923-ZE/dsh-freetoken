@@ -1,0 +1,16 @@
+dsh-Freetoken
+Copyright 2026 dsh-Freetoken contributors
+
+This product is an unofficial, independent plugin for the DeepSeek Harness plugin
+ecosystem. It is NOT affiliated with, endorsed by, or sponsored by DeepSeek.
+"DeepSeek" is a trademark of its respective owner.
+
+Derivative-work notice:
+  Portions of this project are derived from dsh-deepseek-web-login
+  (Copyright 2026 cv-superding (Ding Li)), licensed under the Apache License 2.0.
+  The original project is at https://github.com/cv-superding/dsh-deepseek-web-login
+  Modified by the dsh-Freetoken project: package identity, configuration namespace,
+  lifecycle gating, session mapping, rhythm control, narration handling, and tests.
+
+Use of the chat.deepseek.com private web interface may violate its terms of service
+and can lead to rate limiting or account suspension. Use at your own risk.

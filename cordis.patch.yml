@@ -1,0 +1,8 @@
+# dsh-Freetoken bundle 装配层：走官方装配（dsh plugin add）时自动插入本插件。
+# 默认关闭；启用请改 enabled: true（或由 profile 的 cordis.patch.yml 覆盖 config）。
+# 注意：不要再手动 insert 同 id 的 entry（会撞 duplicate loader entry id）。
+- insert:
+    - id: freetoken
+      name: dsh-freetoken
+      config:
+        enabled: false

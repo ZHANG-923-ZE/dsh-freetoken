@@ -193,6 +193,14 @@ export function createRealBackend(config: FreetokenConfig, deps: RealBackendDeps
       }
       const tokenRotated = merged.auth.token !== current.auth.token
       const identityFilled = !current.userId && Boolean(merged.userId)
+      if (tokenRotated) {
+        /**
+         * 页面自己换出了新 token ⇒ 凭证已经换代，针对**旧凭证**的冷却必须一并解除，
+         * 否则新 token 会被旧冷却挡住续签（同 `resetCredentialSession` 的 P1）。
+         */
+        preflightCooldownUntil = 0
+        renewalTriedThisTurn = false
+      }
       if (tokenRotated || identityFilled) {
         logger?.info?.(
           `freetoken: adopted the transport page credential (token=${tokenRotated ? 'rotated' : 'same'}, identity=${merged.userId ? 'yes' : 'no'}; no account switch)`,
@@ -245,6 +253,9 @@ export function createRealBackend(config: FreetokenConfig, deps: RealBackendDeps
         savedAt: Date.now(),
       }
       saveAuth(next)
+      // 续签成功 ⇒ 凭证已换代：冷却与"本轮已试过"标记都该复位。
+      preflightCooldownUntil = 0
+      renewalTriedThisTurn = false
       // 站点自己换出了新 token：页面已是新凭证，标记可信并尽量对齐安装签名，
       // 免得恢复请求再触发一次“安装 + 重载页面”（那是第二次页面加载）。
       pageCredentialTrusted = true
@@ -586,6 +597,16 @@ export function createRealBackend(config: FreetokenConfig, deps: RealBackendDeps
       // ② 有在飞请求时**不要**立刻杀浏览器（会掐断流、并让登录探活一起卡住）；
       //    注册一次性 idle 钩子，等在飞归零再回收。
       pageCredentialTrusted = false
+      /**
+       * 🔴 必须清掉冷却与"本轮已试过"标记。
+       *
+       * 冷却本来是为了防止"续签失败后每个请求都整页重载"，但它针对的是**旧凭证**。
+       * 用户重新登录后凭证已换新（`savedAt` 也是新的），旧冷却继续生效的后果是：
+       * 新凭证明明可以续上，却被一个针对旧凭证的冷却挡住 —— 表现为"刚重登完，
+       * 第一次请求又撞 401 且不自动恢复"。这是本轮复核怀疑的 P1，确实成立。
+       */
+      preflightCooldownUntil = 0
+      renewalTriedThisTurn = false
       try {
         setTransportUserAgent(readAuth()?.auth?.userAgent)
       } catch {

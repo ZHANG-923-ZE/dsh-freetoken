@@ -91,6 +91,30 @@ try {
   )
   assert.equal(credentialAgeMs(undefined, 1), null)
 
+  // 4) 【P1 反向验证】凭证换代时必须解除冷却
+  //    （否则"刚重新登录 → 第一次请求又被旧冷却挡住续签 → 仍撞 401 且不自动恢复"）
+  //    只有"关掉冷却"这件事发生在**凭证换代**的三个入口，才说明这个坑被堵住：
+  //      ① resetCredentialSession（重新登录）
+  //      ② 页面自己轮换 token（syncCredentialFromPage 里的 tokenRotated）
+  //      ③ 续签成功（renewCredentialViaPage）
+  const cooldownResets = (realBackendSrc.match(/preflightCooldownUntil = 0;/g) ?? []).length
+  assert.ok(
+    cooldownResets >= 3,
+    `credential rotation must reset the cooldown in all 3 paths (found ${cooldownResets})`,
+  )
+  // resetCredentialSession 内部必须有复位（重新登录这条路径最容易漏）
+  const resetFnIndex = realBackendSrc.indexOf('resetCredentialSession()')
+  assert.ok(resetFnIndex >= 0, 'resetCredentialSession must exist')
+  const resetFnBody = realBackendSrc.slice(resetFnIndex, resetFnIndex + 900)
+  assert.ok(
+    resetFnBody.includes('preflightCooldownUntil = 0'),
+    're-login must clear the stale preflight cooldown',
+  )
+  assert.ok(
+    resetFnBody.includes('renewalTriedThisTurn = false'),
+    're-login must clear the per-turn renewal flag',
+  )
+
   console.log('check-lazy-concurrency: PASS')
 } finally {
   rmSync(tempHome, { recursive: true, force: true })

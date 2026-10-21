@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-10-21 · 0.4.1（冷却残留会挡住重新登录后的续签）
+
+复核时留下的一条怀疑，经反向验证**确实成立**：
+
+- 缺陷：`preflightCooldownUntil` 是为**旧凭证**设的（防止续签失败后每请求整页重载），
+  但 `resetCredentialSession()` 没有清它。用户重新登录后凭证已换新，冷却仍在 ——
+  于是新凭证明明可以续上，却被旧冷却挡住续签，表现是"**刚重登完，第一次请求又撞 401
+  且不自动恢复**"，只能再重登一次。
+- 修复：凭证换代的**三个入口**都解除冷却与"本轮已试过"标记 ——
+  ① `resetCredentialSession()`（重新登录）；
+  ② 请求前从页面同步到轮换后的新 token（`syncCredentialFromPage` 的 `tokenRotated`）；
+  ③ 页面续签成功（`renewCredentialViaPage`）。
+- 验证：`check-lazy-concurrency.mjs` 新增断言（三条路径都在、`resetCredentialSession`
+  体内必须复位）；我实测删掉复位后该用例立即变红。构建 0 错、离线 33/33 PASS。
+
 ## 2026-10-20 · 0.4.0（会话所有权：上下文经济 + 常驻会话）
 
 路线正本：`8.12.1.3-Session-Ownership-Route.md`。目标：把“凭证快照 + 跨浏览器重放”

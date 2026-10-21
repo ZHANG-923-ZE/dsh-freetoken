@@ -157,6 +157,30 @@ desktop profile 安装前先备份 `package.json / pnpm-lock.yaml / cordis.patch
 
 命令必须在输入框以 `/freetoken ...` 形式执行；它声明了 input，不会当聊天文本发出去。
 
+## 与其他 provider 并存（网页版 / 官方 API）
+
+本插件**不占用**任何已有的 provider：它只是新增一个 `deepseek-web`（显示名「DeepSeek 网页」），
+和宿主自带的 `deepseek-account`（官方 API）以及其它第三方 provider **并列共存**。
+在模型选择器里各自独立列出，随时切换，互不影响。
+
+| | `deepseek-web`（本插件） | `deepseek-account`（官方 API） |
+|---|---|---|
+| 入口 | 模型选择器 → 「DeepSeek 网页」 | 模型选择器 → 官方 DeepSeek |
+| 凭证 | 浏览器登录态（`/freetoken login`） | API key |
+| 额度 | 网页版免费额度，**有速率限制** | 按量计费 |
+| 稳定性 | 约 2 小时需重登；有风控风险 | 稳定 |
+| 适合 | 偶尔问几句、非关键任务 | 长任务、工具循环、agent 工作负载 |
+
+**什么时候用哪个**（建议）：
+
+- 日常随手问 → 用「DeepSeek 网页」（免费）
+- 要跑工具循环 / 长任务 / 无人值守 → **用官方 API**（网页版会被风控盯上）
+- 网页版被限流或掉登录 → 直接切官方 API，不用改任何配置
+
+**注意**：两个 provider 的**会话上下文互不相通**（各自独立的历史）。同一个 DSH 会话里
+切换 provider，等于换了一个模型后端，之前网页版链式投喂的上下文不会被官方 API 继承。
+需要连续上下文时，整个会话用一个 provider 跑完。
+
 ## 数据与安全
 
 - 所有状态在 `${DSH_HOME:-~/.dsh}/freetoken/`：`auth.json`、`device.json`、`browser-profile/`、

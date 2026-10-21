@@ -181,6 +181,15 @@ desktop profile 安装前先备份 `package.json / pnpm-lock.yaml / cordis.patch
 切换 provider，等于换了一个模型后端，之前网页版链式投喂的上下文不会被官方 API 继承。
 需要连续上下文时，整个会话用一个 provider 跑完。
 
+**模型 id 撞名提醒**：网页版的两个模型沿用 `deepseek-chat` / `deepseek-reasoner`，
+与官方 API 的 id 相同 —— 这**不影响**选择（宿主按 provider + model 二元组区分），
+但有两处要留意：
+
+- 走网页版时如果传了未收录的模型 id（例如官方 API 的 `deepseek-v3.2`），
+  插件会**回退到快速模式**（`resolveSpec` 的兜底），不会报错但也不是你选的那个；
+  需要「深度思考」请显式选 `deepseek-reasoner`。
+- 反过来，官方 API 不认识网页版的两个 id 时按它自己的规则处理，与本插件无关。
+
 ## 数据与安全
 
 - 所有状态在 `${DSH_HOME:-~/.dsh}/freetoken/`：`auth.json`、`device.json`、`browser-profile/`、

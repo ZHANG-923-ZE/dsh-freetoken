@@ -118,11 +118,20 @@ desktop profile 安装前先备份 `package.json / pnpm-lock.yaml / cordis.patch
     localTitle: { enabled: true, maxChars: 32 }
     rhythm:
       jitterMs: { min: 2000, max: 5000 }   # 对数正态，禁止固定周期
-      maxCallsPerTurn: 4
-      silenceMs: { min: 30000, max: 60000 }
-      dailyBudget: 0                        # 0 = 不限制
+      maxCallsPerTurn: 1                    # 一轮只发一次（0.5.0 起，阻止连发）
+      silenceMs: { min: 60000, max: 120000 }
+      silenceScale: { perRequests: 5, stepMs: 120000, capMs: 600000 }
+      dailyBudget: 20                       # 硬性日上限（0 = 不限制）
+      # 滚动窗口限速：任意 rateWindowMs 内最多 rateMaxInWindow 次。
+      # 比日预算精细 —— 日预算防总量，这条防"短时突发"（封禁的真实形态）。
+      rateWindowMs: 1800000
+      rateMaxInWindow: 6
+      # 连续请求长休：连续 N 次后强制休息 3–5 分钟（"连续跑"比"总量多"更像脚本）。
+      longRunThreshold: 5
+      longRunBreakMs: { min: 180000, max: 300000 }
     retry: { maxRetries: 3, baseDelayMs: 5000, factor: 2, maxDelayMs: 120000, jitterRatio: 0.3 }
-    safety: { testAccountOnly: true, haltOnMute: true }
+    safety: { testAccountOnly: true, haltOnMute: true, minRequestGapMs: 60000 }
+    protocol: { autoContinue: false }      # 不自动续写（每轮续写都是一次真实请求）
     session:
       reuseTurns: 20
       cleanup: deferred

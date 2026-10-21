@@ -21,6 +21,7 @@ import { DailyBudget } from './daily.js'
 import { nextJitter } from './jitter.js'
 import { SerialLock } from './lock.js'
 import { PendingQueue } from './queue.js'
+import { LongRunGuard, RateWindow } from './rate-window.js'
 import { nextRetry } from './retry.js'
 import { silenceDuration } from './silence.js'
 
@@ -209,6 +210,24 @@ export function createRhythmController(deps: RhythmControllerDeps): RhythmContro
   const queue = new PendingQueue({ maxPending: config.queue.maxPending })
   const lock = new SerialLock()
   const burst = new BurstTracker({ maxCalls: config.rhythm.maxCallsPerTurn })
+  /**
+   * 滚动窗口限速（S3.1）：防"短时突发"。
+   * 日预算只防总量，防不住"7 次挤在 3 分钟"——那正是 2026-10-20 封禁的真实形态。
+   */
+  const rateWindow = new RateWindow({
+    windowMs: config.rhythm.rateWindowMs,
+    maxInWindow: config.rhythm.rateMaxInWindow,
+    now,
+  })
+  /**
+   * 连续请求长休（S3.1）：防"连续跑"。
+   * "连续 N 次、每次间隔很短"比"总请求数多"更像脚本，这是对形态的直接约束。
+   */
+  const longRun = new LongRunGuard({
+    threshold: config.rhythm.longRunThreshold,
+    breakMs: config.rhythm.longRunBreakMs,
+    random,
+  })
   const lifetime = new AbortController()
 
   let disposed = false
@@ -243,6 +262,12 @@ export function createRhythmController(deps: RhythmControllerDeps): RhythmContro
         lastRequestAt,
         msSinceLastRequest: lastRequestAt === null ? null : Math.max(0, now() - lastRequestAt),
         lastBlock: lastBlock === null ? null : { ...lastBlock },
+        // S3.1：把两道新护栏的**实际用量**回填，面板才能回答"我现在还能发几次"。
+        rateWindowMs: config.rhythm.rateWindowMs,
+        rateMaxInWindow: config.rhythm.rateMaxInWindow,
+        rateUsedInWindow: rateWindow.snapshot().count,
+        longRunThreshold: config.rhythm.longRunThreshold,
+        longRunConsecutive: longRun.count,
       },
       queue: { pending: queue.size(), maxPending: config.queue.maxPending },
       lock: {
@@ -282,6 +307,8 @@ export function createRhythmController(deps: RhythmControllerDeps): RhythmContro
         if (released || sent) return
         sent = true
         daily.record()
+        // 滚动窗口只记**真正发出去**的请求（与站点看到的次数一致）。
+        rateWindow.record()
         lastRequestAt = now()
         reportMetric('rhythm.request')
         reportMetric('rhythm.today_requests', daily.snapshot().todayRequests)
@@ -409,11 +436,40 @@ export function createRhythmController(deps: RhythmControllerDeps): RhythmContro
         publish()
       }
 
+      /**
+       * 滚动窗口限速（S3.1）。
+       *
+       * 位置：静默之后、**拿锁之前** —— 等待期间不占串行锁，不影响其它会话排队。
+       * `waitMs` 是"最早那条滑出窗口"的时间，等完就能发，不需要循环重试
+       *（注入 sleep 可能不推进 now，循环会死等 —— 同静默那段的教训）。
+       */
+      const windowCheck = rateWindow.check()
+      if (windowCheck.waitMs > 0) {
+        phase = 'cooldown'
+        setBlock('rate-window', now() + windowCheck.waitMs)
+        reportMetric('rhythm.rate_window_ms', windowCheck.waitMs)
+        await wait(windowCheck.waitMs, signal)
+      }
+
       releaseLock = await lock.acquire(signal)
       lockHeldAt = now()
       lockHolder = describeRequest(options)
       phase = 'jittering'
       publish()
+
+      /**
+       * 连续请求长休（S3.1）。
+       *
+       * 放在拿锁之后：`burst.observe`/`daily.record` 在 markSent 时才记，
+       * 而长休是针对"已经连续发了 N 次"的节奏约束，与具体请求同生命周期更直观。
+       */
+      const longRunDecision = longRun.observe()
+      if (longRunDecision.shouldBreak && longRunDecision.breakMs > 0) {
+        phase = 'cooldown'
+        setBlock('long-run', now() + longRunDecision.breakMs)
+        reportMetric('rhythm.long_run_break_ms', longRunDecision.breakMs)
+        await wait(longRunDecision.breakMs, signal)
+      }
 
       // R11 / M21：发送前抖动；硬下限由 nextJitter 夹取保证。
       const jitterMs = nextJitter({ range: config.rhythm.jitterMs, random })

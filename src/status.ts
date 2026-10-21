@@ -11,7 +11,17 @@ import type { FreetokenConfig } from './config.js'
 export type RhythmPhase = 'idle' | 'aggregating' | 'jittering' | 'sending' | 'silence' | 'cooldown'
 
 export interface LastBlock {
-  reason: 'silence' | 'daily-budget' | 'burst-cap' | 'queue-full' | 'mute-halt' | 'manual'
+  reason:
+    | 'silence'
+    | 'daily-budget'
+    | 'burst-cap'
+    | 'queue-full'
+    | 'mute-halt'
+    | 'manual'
+    /** 滚动窗口限速：`windowMs` 内已达 `maxInWindow` 次，强制等配额。 */
+    | 'rate-window'
+    /** 连续请求长休：连续 N 次后强制休息（防"连续跑"的脚本形态）。 */
+    | 'long-run'
   at: number
   until?: number
 }
@@ -76,6 +86,13 @@ export interface StatusSnapshot {
     lastRequestAt: number | null
     msSinceLastRequest: number | null
     lastBlock: LastBlock | null
+    /** 滚动窗口限速（S3.1）：窗口长度与窗口内已用次数（面板显示"还能发几次"）。 */
+    rateWindowMs: number
+    rateMaxInWindow: number
+    rateUsedInWindow: number
+    /** 连续请求长休（S3.1）：阈值与当前连续数。 */
+    longRunThreshold: number
+    longRunConsecutive: number
   }
   retry: {
     attempts: number
@@ -130,6 +147,11 @@ export function disabledSnapshot(config: FreetokenConfig): StatusSnapshot {
       lastRequestAt: null,
       msSinceLastRequest: null,
       lastBlock: null,
+      rateWindowMs: config.rhythm.rateWindowMs,
+      rateMaxInWindow: config.rhythm.rateMaxInWindow,
+      rateUsedInWindow: 0,
+      longRunThreshold: config.rhythm.longRunThreshold,
+      longRunConsecutive: 0,
     },
     retry: { attempts: 0, nextDelayMs: 0 },
     safety: {

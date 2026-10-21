@@ -1,5 +1,53 @@
 # Changelog
 
+## 2026-10-21 · 0.5.0（保守降载：补上两个"看着有、实际无"的护栏）
+
+用户裁决（D34）：把使用强度压到"普通用户"水平，减少触发风控的概率。
+注意：这是**真的降低负载**，不是伪装成人类——两者性质不同。
+
+### 1. 修掉三个死参数（本轮最重要的修复）
+
+`rhythm.rateWindowMs` / `rhythm.rateMaxInWindow` / `rhythm.longRunThreshold`
+三个配置项**一直在读、从未生效**：vendor 的 `gate.ts` 有完整实现，但本插件从未
+实例化 `createRequestGate()`，所以"30 分钟最多 N 次"和"连续 N 次后长休"从来不存在。
+
+新增 `rhythm/rate-window.ts` 独立实现这两条（不接 gate —— 那个自带串行队列，
+与我们的 `SerialLock` 重复，硬接会变成两层队列），接入 `RhythmController`：
+
+- **滚动窗口限速**：任意窗口内最多 N 次，超出则等配额滑出。比日预算精细 ——
+  日预算只防总量，防不住"7 次挤在 3 分钟"（2026-10-20 封禁的真实形态）。
+- **连续请求长休**：连续 N 次后强制休息 3–5 分钟。"连续跑 N 次且间隔很短"
+  比"总请求数多"更像脚本，这是对形态的直接约束。
+
+### 2. 默认值进一步收紧（D34）
+
+| 参数 | 旧 | 新 | 作用 |
+|---|---|---|---|
+| `rhythm.maxCallsPerTurn` | 2 | **1** | 一轮只发一次，结构上阻止连发 |
+| `protocol.autoContinue` | true | **false** | 不自动续写（每轮续写都是一次真实请求） |
+| `safety.minRequestGapMs` | 15s | **60s** | 两次请求最小间隔 |
+| `rhythm.dailyBudget` | 100 | **20** | 硬性日上限 |
+| `rhythm.silenceMs` | 30–60s | **60–120s** | 基础静默加倍 |
+| `rhythm.silenceScale.perRequests` | 10 | **5** | 更早开始递增静默 |
+| `rhythm.rateMaxInWindow` | 20 | **6** | 30 分钟内最多 6 次 |
+| `rhythm.longRunThreshold` | 15 | **5** | 连续 5 次后长休 |
+
+实测（注入时钟跑 8 次连续请求）：第 5 次触发长休（~288s），第 7 次触发窗口限速
+（~15min 等待），8 次请求累计等待约 33.5 分钟 —— 这就是"6 次/30 分钟"的语义。
+
+### 3. 可观测性
+
+- `LastBlock.reason` 新增 `rate-window` / `long-run`，面板能看到"为什么在等"。
+- status 暴露 `rateUsedInWindow` / `rateMaxInWindow` / `longRunConsecutive` /
+  `longRunThreshold`（真实用量，不是静态配置回显）。
+- `/freetoken status` 新增 `guards:` 行，显示窗口用量与连续计数。
+
+### 验证
+
+- 新增 `check-rate-window.mjs`（窗口滑出、关闭开关、连休归零、两护栏互不干扰）。
+- 扩展 `check-conservative.mjs`：新增"窗口限速真的拦""长休真的触发""全关后无实质等待"三组用例。
+- 构建 0 错；离线 **35/35 PASS**。
+
 ## 2026-10-21 · 0.4.2（登录失败被误报成"被拦截"：实为 launcher 早退）
 
 真机现象：`/freetoken login` 报

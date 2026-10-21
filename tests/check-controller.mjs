@@ -103,7 +103,20 @@ test('queue full fast-fails with QUEUE_FULL', async () => {
 })
 
 test('jitter: 500 samples inside 2-5s, median >= 2s, non-uniform', async () => {
-  const h = build({}, { random: seeded(123456789) })
+  // D34 起默认 maxCallsPerTurn=1、rateMaxInWindow=6、longRunThreshold=5，
+  // 本用例只验**抖动分布** ⇒ 显式关掉那三道护栏，避免它们叠加 sleep 干扰采样。
+  const h = build(
+    {
+      rhythm: {
+        maxCallsPerTurn: 16,
+        rateMaxInWindow: 0,
+        longRunThreshold: 0,
+        dailyBudget: 0,
+      },
+      safety: { minRequestGapMs: 0 },
+    },
+    { random: seeded(123456789) },
+  )
   const samples = []
   for (let i = 0; i < 500; i += 1) {
     const before = h.sleeps.length
@@ -125,28 +138,42 @@ test('jitter: 500 samples inside 2-5s, median >= 2s, non-uniform', async () => {
   assert.ok(distinct > 50, `jitter must not be fixed/quantized: only ${distinct} distinct values`)
 })
 
-test('silence starts after the 10th request and is consumed by the next acquire', async () => {
-  const h = build({}, { random: seeded(42) })
+test('silence starts after the configured perRequests and is consumed by the next acquire', async () => {
+  // D34：silenceScale.perRequests 从 10 改为 5（更早开始冷静）；基础静默 60–120s。
+  // 用显式配置把这两条钉住，避免跟着默认值漂移。
+  const h = build({
+    rhythm: {
+      silenceScale: { perRequests: 5 },
+      silenceMs: { min: 60000, max: 120000 },
+      // 关掉 S3.1 的两道新护栏，本用例只验"静默何时开始/如何消费"
+      rateMaxInWindow: 0,
+      longRunThreshold: 0,
+      maxCallsPerTurn: 16,
+      dailyBudget: 0,
+    },
+    safety: { minRequestGapMs: 0 },
+  })
   const sessionId = 'silence-session'
-  for (let i = 0; i < 10; i += 1) {
+  const perRequests = 5
+  for (let i = 0; i < perRequests; i += 1) {
     const lease = await h.controller.acquire({ sessionId, kind: 'chat' })
     lease.markSent()
     lease.release()
-    if (i < 9) {
+    if (i < perRequests - 1) {
       assert.equal(
         h.controller.snapshot().silent,
         false,
-        `silence must not start before 10 requests (i=${i})`,
+        `silence must not start before ${perRequests} requests (i=${i})`,
       )
     }
   }
   const paused = h.controller.snapshot()
-  assert.equal(paused.todayRequests, 10)
+  assert.equal(paused.todayRequests, perRequests)
   assert.equal(paused.silent, true)
   assert.equal(paused.phase, 'silence')
   assert.ok(
-    paused.silenceRemainingMs >= 30000 && paused.silenceRemainingMs <= 60000,
-    `silence after 20 requests must be 30-60s, got ${paused.silenceRemainingMs}ms`,
+    paused.silenceRemainingMs >= 60000 && paused.silenceRemainingMs <= 120000,
+    `silence after ${perRequests} requests must be 60-120s, got ${paused.silenceRemainingMs}ms`,
   )
   const status = lastStatus(h.statuses)
   assert.equal(status.rhythm.silent, true)
@@ -321,15 +348,26 @@ test('snapshot and status patches are honest and structuredClone-safe', async ()
   assert.equal(snap.lastRequestAt, NOW)
   assert.equal(snap.todayRequests, 1)
   const status = lastStatus(h.statuses)
+  // S3.1 起 rhythm 契约新增 5 个字段（滚动窗口 + 连休），面板据此显示用量
   assert.deepEqual(Object.keys(status.rhythm).sort(), [
     'dailyBudget',
     'lastBlock',
     'lastRequestAt',
+    'longRunConsecutive',
+    'longRunThreshold',
     'msSinceLastRequest',
+    'rateMaxInWindow',
+    'rateUsedInWindow',
+    'rateWindowMs',
     'silenceRemainingMs',
     'silent',
     'todayRequests',
   ])
+  // 字段必须反映**真实用量**，不是摆设
+  assert.equal(status.rhythm.rateUsedInWindow, 1, 'rate counter must reflect the one sent request')
+  assert.equal(status.rhythm.rateMaxInWindow, h.config.rhythm.rateMaxInWindow)
+  assert.equal(status.rhythm.longRunThreshold, h.config.rhythm.longRunThreshold)
+  assert.equal(status.rhythm.longRunConsecutive, 1, 'long-run counter must reflect the sent request')
   assert.equal(status.rhythm.lastRequestAt, NOW)
   assert.equal(status.rhythm.msSinceLastRequest, 0)
   assert.equal(status.rhythm.todayRequests, 1)

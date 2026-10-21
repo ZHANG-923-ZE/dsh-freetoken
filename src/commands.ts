@@ -39,6 +39,12 @@ function renderStatus(snapshot: StatusSnapshot, config: FreetokenConfig): string
       ` | today=${snapshot.rhythm.todayRequests}` +
       `${snapshot.rhythm.dailyBudget > 0 ? `/${snapshot.rhythm.dailyBudget}` : ''}` +
       `${snapshot.rhythm.silent ? ` | remaining=${Math.ceil(snapshot.rhythm.silenceRemainingMs / 1000)}s` : ''}`,
+    // S3.1：两道新护栏的**真实用量**（面板/命令都能回答"我现在还能发几次"）
+    `guards: window=${snapshot.rhythm.rateUsedInWindow}` +
+      `${snapshot.rhythm.rateMaxInWindow > 0 ? `/${snapshot.rhythm.rateMaxInWindow}` : ''}` +
+      ` per ${Math.round(snapshot.rhythm.rateWindowMs / 60000)}min` +
+      ` | long-run=${snapshot.rhythm.longRunConsecutive}` +
+      `${snapshot.rhythm.longRunThreshold > 0 ? `/${snapshot.rhythm.longRunThreshold}` : ' (off)'}`,
     `last-request: ${age(snapshot.rhythm.msSinceLastRequest)} ago` +
       ` | last-block: ${
         snapshot.rhythm.lastBlock

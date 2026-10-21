@@ -90,6 +90,8 @@ export interface FreetokenConfig {
     }
     dailyBudget: number
     longRunThreshold: number
+    /** 连续请求长休的时长区间（ms）。与 `longRunThreshold` 配套。 */
+    longRunBreakMs: Range
     rateWindowMs: number
     rateMaxInWindow: number
   }
@@ -148,17 +150,19 @@ export const DEFAULT_CONFIG: FreetokenConfig = Object.freeze({
   coalesce: { enabled: true, maxConsumers: 4 },
   localTitle: { enabled: true, maxChars: 32 },
   retry: { maxRetries: 3, baseDelayMs: 5000, factor: 2, maxDelayMs: 120000, jitterRatio: 0.3 },
-  safety: { testAccountOnly: true, haltOnMute: true, minRequestGapMs: 15000 },
+  safety: { testAccountOnly: true, haltOnMute: true, minRequestGapMs: 60000 },
   rhythm: {
     jitterMs: { min: 2000, max: 5000 },
-    // 保守模式（2026-10-20 封禁事件后，用户拍板收紧；见 Decision Log D33）
-    maxCallsPerTurn: 2,
-    silenceMs: { min: 30000, max: 60000 },
-    silenceScale: { perRequests: 10, stepMs: 120000, capMs: 600000 },
-    dailyBudget: 100,
-    longRunThreshold: 15,
+    // 保守模式（2026-10-20 封禁事件后收紧；2026-10-21 按用户裁决进一步降载，见 D34）
+    // maxCallsPerTurn=1：一轮只发一次，从结构上阻止工具循环连发请求。
+    maxCallsPerTurn: 1,
+    silenceMs: { min: 60000, max: 120000 },
+    silenceScale: { perRequests: 5, stepMs: 120000, capMs: 600000 },
+    dailyBudget: 20,
+    longRunThreshold: 5,
+    longRunBreakMs: { min: 180000, max: 300000 },
     rateWindowMs: 1800000,
-    rateMaxInWindow: 20,
+    rateMaxInWindow: 6,
   },
   session: {
     reuseTurns: 20,
@@ -174,7 +178,8 @@ export const DEFAULT_CONFIG: FreetokenConfig = Object.freeze({
   },
   protocol: {
     serialToolCalls: true,
-    autoContinue: true,
+    // 不自动续写：每多一轮续写就多一次真实请求，而工具循环本就是最大的封号诱因。
+    autoContinue: false,
     maxContinuations: 1,
     forbidProbingQuestions: true,
   },
@@ -357,6 +362,12 @@ export function normalizeConfig(raw: unknown): FreetokenConfig {
         DEFAULT_CONFIG.rhythm.longRunThreshold,
         0,
         100,
+      ),
+      longRunBreakMs: readRange(
+        rhythm,
+        'longRunBreakMs',
+        DEFAULT_CONFIG.rhythm.longRunBreakMs,
+        { min: 1000, max: 1800000 },
       ),
       rateWindowMs: readInt(rhythm, 'rateWindowMs', DEFAULT_CONFIG.rhythm.rateWindowMs, 60000, 86400000),
       rateMaxInWindow: readInt(

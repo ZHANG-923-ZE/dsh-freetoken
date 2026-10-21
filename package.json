@@ -1,6 +1,6 @@
 {
   "name": "dsh-freetoken",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Unofficial DSH plugin: deepseek-web provider bridge for development use (disabled by default).",
   "keywords": [
     "dsh",

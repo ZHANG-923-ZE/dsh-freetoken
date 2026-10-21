@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-10-21 · 0.4.2（登录失败被误报成"被拦截"：实为 launcher 早退）
+
+真机现象：`/freetoken login` 报
+`Microsoft Edge 起来了但调试端口不可用（可能被安全软件拦截）`。
+
+排查结论（只读取证）：**不是拦截、不是封禁** —— 当时该 profile 的
+`DevToolsActivePort` 写着 57841，`GET http://127.0.0.1:57841/json/version`
+返回 **HTTP 200**（`Edg/155.0.4283.45`），浏览器明明正常。
+
+根因（与 transport 侧早已修过的 PR #19 是同一个坑，login 侧一直没同步）：
+
+- `browser-login.ts` 的 `waitForDebugPort` 里有
+  `if (child.exitCode !== null) return undefined`。
+  Windows 上 Edge 会把启动**交接给真正的浏览器进程后自身退出**，而
+  `DevToolsActivePort` 往往**在 launcher 退出之后**才写出来 ⇒ 代码在读到端口前
+  就放弃，然后给出"可能被安全软件拦截"这种误导性结论。
+
+修复：
+
+- `waitForDebugPort` 去掉 launcher 存活判据，只认「端口文件 + 截止时间」。
+- 启动登录浏览器前清掉上一次残留的句柄文件
+  （`DevToolsActivePort` / `lockfile` / `Singleton*`）：残留端口文件会连到已退出的
+  浏览器；残留 `Singleton*` 会让新进程误以为"已有实例"而交接后自杀。
+- **只删句柄、不删 profile** ⇒ 登录态（cookie/localStorage）保留，
+  重登不必每次重新输手机号验证码。
+- `no-debug-port` 的报错文案改为如实列出三种常见原因（残留浏览器占 profile /
+  安全软件 / 权限），不再暗示"被拦截"。
+
+验证：新增 `check-login-port.mjs`（4 组反向断言：launcher 早退不得放弃、
+必须清句柄、文案不得甩锅拦截、不得整目录清空登录态）；
+构建 0 错、离线 **34/34 PASS**。
+
 ## 2026-10-21 · 0.4.1（冷却残留会挡住重新登录后的续签）
 
 复核时留下的一条怀疑，经反向验证**确实成立**：

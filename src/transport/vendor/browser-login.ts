@@ -416,7 +416,18 @@ async function waitForDebugPort(
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (signal?.aborted) return undefined
-    if (child.exitCode !== null) return undefined
+    /**
+     * 🔴 **不要**因为 launcher 进程退出就放弃（与 `browser-transport.ts` 的 PR #19 洞察同一条）。
+     *
+     * Windows 上 `msedge.exe` 会把启动**交接给真正的浏览器进程后自身退出**，
+     * 而 `DevToolsActivePort` 往往是**在 launcher 退出之后**才写出来的。
+     * 旧写法一看 `child.exitCode !== null` 就 `return undefined`
+     * ⇒ 上层报「Edge 起来了但调试端口不可用（可能被安全软件拦截）」
+     * ⇒ 浏览器明明是好的，登录却永远失败（2026-10-21 真机实测：端口 57841
+     *    正在正常响应 `/json/version`，但代码已经放弃）。
+     *
+     * 判据只留两个：**端口文件 + 截止时间**。launcher 的死活不参与。
+     */
     try {
       const port = parseDevToolsActivePort(readFileSync(portFile, 'utf8'))
       if (port) {
@@ -552,6 +563,24 @@ export async function browserLogin(options: BrowserLoginOptions = {}): Promise<B
     mkdirSync(profileDir, { recursive: true })
   } catch {}
 
+  /**
+   * 🔴 启动前先清掉**上一次**留下的句柄文件（与 transport 侧同一坑）。
+   *
+   * `DevToolsActivePort` 残留时，`waitForDebugPort` 会立刻读到**旧端口**并去探它 ——
+   * 那个浏览器早已退出，探测必然失败；更糟的是如果那个端口恰好被别的进程占用，
+   * 会连到错误的目标。`lockfile` / `Singleton*` 残留则会让新进程误以为
+   * "已有实例在跑"、把启动交接给不存在的实例后自己退出。
+   *
+   * 只删运行时句柄，不动 cookie/localStorage（登录 profile 的登录态要保留）。
+   */
+  for (const stale of ['DevToolsActivePort', 'lockfile', 'SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+    try {
+      rmSync(join(profileDir, stale), { force: true })
+    } catch {
+      // 删不掉就靠端口探测兜底
+    }
+  }
+
   progress(`正在启动 ${browser.name}（独立 profile，不会影响你日常浏览器的登录态）……`)
   let child: ChildProcess
   try {
@@ -601,7 +630,18 @@ export async function browserLogin(options: BrowserLoginOptions = {}): Promise<B
     return {
       ok: false,
       reason: 'no-debug-port',
-      message: `${browser.name} 起来了但调试端口不可用（可能被安全软件拦截）。请改用「用我的默认浏览器登录」+ 手动粘贴 Token。`,
+      /**
+       * 文案必须说实话（2026-10-21）：这条失败**绝大多数不是**安全软件拦截，而是
+       * ① Windows 上 launcher 交接后自己先退出（旧代码据此提前放弃，已修）；
+       * ② 端口文件/单实例句柄残留（已修）；
+       * ③ 上一次的 Edge 还占着同一个 profile（目录被锁，新进程起不来）。
+       * 给"拦截"的暗示会把人引向错误的排查方向。
+       */
+      message:
+        `${browser.name} 没有就绪的调试端口。常见原因：` +
+        `① 上一次的浏览器还占着这个登录 profile（请关掉所有用该 profile 的窗口后重试）；` +
+        `② 安全软件拦了本地调试端口；` +
+        `③ profile 目录权限异常。这不是账号被限制，也不影响已有凭证。`,
     }
   }
 

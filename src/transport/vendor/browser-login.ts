@@ -370,6 +370,16 @@ export interface BrowserLoginOptions {
 const DEFAULT_TIMEOUT_MS = 5 * 60_000
 const DEFAULT_PROFILE_DIR = join(webLoginDir(), 'browser-profile')
 
+/**
+ * CDP 连续失联轮数上限（0.5.1）。
+ *
+ * 判定「浏览器真的被关掉」不能看子进程退出码：Windows 上 `msedge.exe` 的 launcher
+ * 会把启动交接给真正的浏览器进程后自身退出（见 `waitForDebugPort` 同款洞察）。
+ * 只认 CDP 连续探测失败：默认轮询 1.2s，8 轮 ≈ 10s 连续失联才判定关闭，
+ * 足够跨过页面跳转/SPA 启动期的短暂失败，又不会让用户关窗后空等太久。
+ */
+const CDP_MISS_LIMIT = 8
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
 /**
@@ -403,6 +413,21 @@ export function isDeepSeekPage(target: any): boolean {
   } catch {
     return false
   }
+}
+
+/**
+ * 浏览器是否真的已经关闭（纯函数，便于反向验证）。
+ *
+ * 🔴 R7 勘误（0.5.1，2026-10-23 真机事故）：旧判据是 `child.exitCode !== null || child.killed`，
+ * 把「launcher 交棒后自然退出」误判成「用户关了浏览器」——真浏览器还开着、页面停在
+ * chat.deepseek.com，登录却在第一轮就被判 `browser-closed`（现场：browser-profile 的 Edge
+ * 进程活着、CDP 端口 59892 正常响应，插件却报「浏览器已关闭，登录已取消」）。
+ *
+ * 新判据只看两件事：显式 kill（取消/清理），或 CDP 连续失联达到上限。
+ * launcher 的自然退出（exitCode 非空但未被 kill）不参与判定。
+ */
+export function isBrowserGone(state: { killed: boolean; cdpMisses: number; missLimit: number }): boolean {
+  return state.killed || state.cdpMisses >= state.missLimit
 }
 
 /** 等 CDP 的 HTTP 端点可用，返回调试端口。 */
@@ -694,6 +719,8 @@ export async function browserLogin(options: BrowserLoginOptions = {}): Promise<B
 
   const deadline = Date.now() + timeoutMs
   let lastNotice = 0
+  /** CDP 连续失联计数（0.5.1）：替代旧的「子进程退出即关闭」判据，见 isBrowserGone。 */
+  let cdpMisses = 0
   try {
     while (Date.now() < deadline) {
       if (options.signal?.aborted) {
@@ -701,14 +728,17 @@ export async function browserLogin(options: BrowserLoginOptions = {}): Promise<B
         cleanupBrowser()
         return { ok: false, reason: 'aborted', message: '已取消登录。' }
       }
-      // R7（0.1.84）：用户关掉浏览器后，CDP 调用会一直抛错被内层 catch 吞掉，
-      // 循环要空转到 deadline 才退。看子进程退出码，提前结束。
-      if (child.exitCode !== null || child.killed) {
+      // R7 勘误（0.5.1，2026-10-23 真机事故）：旧写法 `child.exitCode !== null || child.killed`
+      // 把「launcher 交棒后自然退出」误判成「用户关了浏览器」，真浏览器还开着就报
+      // browser-closed（详见 isBrowserGone 注释）。显式 kill 仍即时终止；
+      // 自然退出的子进程不参与判定，改由下面的 CDP 连续失联计数兜底。
+      if (child.killed) {
         cleanupBrowser()
         return { ok: false, reason: 'browser-closed', message: '浏览器已关闭，登录已取消。需要的话再点一次「浏览器窗口登录」即可。' }
       }
       let token = ''
       let pageUserAgent = ''
+      let cdpOk = false
       try {
         const value = await cdp.send('Runtime.evaluate', {
           expression: "String(localStorage.getItem('userToken') || '')",
@@ -717,8 +747,15 @@ export async function browserLogin(options: BrowserLoginOptions = {}): Promise<B
         token = unwrapStoredToken(String(value?.result?.value ?? ''))
         const ua = await cdp.send('Runtime.evaluate', { expression: 'navigator.userAgent', returnByValue: true })
         pageUserAgent = String(ua?.result?.value ?? '')
+        cdpOk = true
       } catch {
         // 页面可能在跳转，下一轮再试
+      }
+      if (cdpOk) cdpMisses = 0
+      else cdpMisses += 1
+      if (isBrowserGone({ killed: child.killed, cdpMisses, missLimit: CDP_MISS_LIMIT })) {
+        cleanupBrowser()
+        return { ok: false, reason: 'browser-closed', message: '浏览器已关闭，登录已取消。需要的话再点一次「浏览器窗口登录」即可。' }
       }
 
       if (token) {

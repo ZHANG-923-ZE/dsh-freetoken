@@ -1,5 +1,42 @@
 # Changelog
 
+## 2026-10-23 · 0.5.1（修 R7 勘误：launcher 退出被误判成「浏览器已关闭」）
+
+### 事故
+
+用户在面板点「浏览器窗口登录」，浏览器窗口明明开着、页面已停在 `chat.deepseek.com`，
+插件却立即报 `freetoken: browser login failed: 浏览器已关闭，登录已取消。…`。
+
+现场取证（2026-10-23 19:34–19:35）：
+
+- `freetoken\browser-profile` 的 Edge 主进程从 19:34:25 起持续存活；
+- 该 profile 的 `DevToolsActivePort` 写着端口 59892，CDP `/json/list` 正常返回 DeepSeek 页面；
+- 插件在 19:35:56 记了一次尝试（`usage.json`），返回 `browser-closed`。
+
+### 根因
+
+登录态轮询里残留旧判据 `child.exitCode !== null || child.killed`。
+Windows 上 `msedge.exe` 的 launcher 会把启动交接给真正的浏览器进程后**自身退出**，
+于是子进程退出码非空、真浏览器却活着 —— 与 `waitForDebugPort` 里已经修过的
+PR #19 同款坑，只是那一处修了、轮询这一处没修。
+
+### 修复
+
+新增导出纯函数 `isBrowserGone({ killed, cdpMisses, missLimit })`：只认「显式 kill」
+或「CDP 连续失联达上限（`CDP_MISS_LIMIT = 8`，默认轮询 1.2s ≈ 10s）」；
+launcher 的自然退出不参与判定。轮询里 CDP 调用成功即清零失联计数。
+
+### 验证
+
+- 新增 `tests/check-browser-liveness.mjs`：四条正向/边界 + 两条源码反向验证
+  （旧判据字符串不得残留、`isBrowserGone` 必须接线）——改回旧实现该用例必红。
+- `node scripts/build.mjs` + `node tests/run-offline.mjs` 全绿（见 8.12.5-Ledgers）。
+
+### 遗留（未在本版修）
+
+`transport.lock` 陈旧 pid（69236 已不在）与 transport-profile 浏览器长期常驻
+（2026-10-21 至今）未处理，属独立议题，另批评估启动对账与空闲回收。
+
 ## 2026-10-21 · 0.5.0（保守降载：补上两个"看着有、实际无"的护栏）
 
 用户裁决（D34）：把使用强度压到"普通用户"水平，减少触发风控的概率。
